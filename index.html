@@ -109,6 +109,8 @@
   .status{font-size:13px;padding:10px 12px;border-radius:var(--radius);margin-bottom:14px;}
   .status.ok{background:var(--green-soft);color:var(--green-dark);}
   .status.err{background:#fbeceb;color:var(--danger);}
+  .edit-banner{font-size:13px;padding:10px 12px;border-radius:var(--radius);margin-bottom:14px;background:#fff6df;color:#7a5c00;display:flex;justify-content:space-between;align-items:center;gap:10px;}
+  .edit-banner a{color:#7a5c00;text-decoration:underline;cursor:pointer;font-weight:600;white-space:nowrap;}
 
   .history-item{
     border:1px solid var(--line);border-radius:6px;padding:12px 14px;margin-bottom:10px;
@@ -142,6 +144,7 @@
   </div>
 
   <div id="statusBox"></div>
+  <div id="editBanner" style="display:none;"></div>
 
   <!-- NOVO RELATÓRIO -->
   <div id="tab-novo">
@@ -222,7 +225,8 @@ document.getElementById('topbarLogoRight').src = LOGO_RIGHT;
 
 const state = {
   photos: { antes:[null,null], durante:[null,null], depois:[null] },
-  logos: { left: LOGO_LEFT, right: LOGO_RIGHT }
+  logos: { left: LOGO_LEFT, right: LOGO_RIGHT },
+  editingId: null
 };
 
 function todayISO(){ return new Date().toISOString().slice(0,10); }
@@ -474,6 +478,32 @@ async function urlToDataURL(url){
 
 // Salva um atendimento completo: cria a linha em "atendimentos" (o id vira o
 // número sequencial), sobe cada foto pro bucket e registra em "fotos".
+async function uploadFotos(atendimentoId, photos){
+  const uploads = [];
+  ['antes','durante','depois'].forEach(etapa=>{
+    photos[etapa].forEach((p, idx)=>{
+      if(!p) return;
+      uploads.push((async ()=>{
+        const path = `${atendimentoId}/${etapa}_${idx}_${Date.now()}.jpg`;
+        const blob = dataUrlToBlob(p.full);
+        const { error: errUp } = await sb.storage.from(FOTOS_BUCKET).upload(path, blob, { contentType:'image/jpeg', upsert:true });
+        if(errUp) throw errUp;
+        const { error: errFoto } = await sb.from('fotos').insert({ atendimento_id: atendimentoId, etapa, ordem: idx, storage_path: path });
+        if(errFoto) throw errFoto;
+      })());
+    });
+  });
+  await Promise.all(uploads);
+}
+
+async function removerFotosDoAtendimento(id){
+  const { data: fotos } = await sb.from('fotos').select('storage_path').eq('atendimento_id', id);
+  if(fotos && fotos.length){
+    await sb.storage.from(FOTOS_BUCKET).remove(fotos.map(f=>f.storage_path));
+  }
+  await sb.from('fotos').delete().eq('atendimento_id', id);
+}
+
 async function salvarAtendimentoSupabase(form, photos){
   const { data: atendimento, error: errAt } = await sb.from('atendimentos').insert({
     tecnico: form.tecnico, base: form.base, data: form.data, local: form.local,
@@ -481,23 +511,22 @@ async function salvarAtendimentoSupabase(form, photos){
     obs_antes: form.obsAntes, obs_durante: form.obsDurante, obs_depois: form.obsDepois
   }).select().single();
   if(errAt) throw errAt;
-
-  const uploads = [];
-  ['antes','durante','depois'].forEach(etapa=>{
-    photos[etapa].forEach((p, idx)=>{
-      if(!p) return;
-      uploads.push((async ()=>{
-        const path = `${atendimento.id}/${etapa}_${idx}.jpg`;
-        const blob = dataUrlToBlob(p.full);
-        const { error: errUp } = await sb.storage.from(FOTOS_BUCKET).upload(path, blob, { contentType:'image/jpeg', upsert:true });
-        if(errUp) throw errUp;
-        const { error: errFoto } = await sb.from('fotos').insert({ atendimento_id: atendimento.id, etapa, ordem: idx, storage_path: path });
-        if(errFoto) throw errFoto;
-      })());
-    });
-  });
-  await Promise.all(uploads);
+  await uploadFotos(atendimento.id, photos);
   return atendimento.id;
+}
+
+// Atualiza um atendimento já salvo: troca os dados e substitui todas as fotos
+// pelo conjunto atual (mais simples e sem risco de duplicar/perder foto).
+async function atualizarAtendimentoSupabase(id, form, photos){
+  const { error: errAt } = await sb.from('atendimentos').update({
+    tecnico: form.tecnico, base: form.base, data: form.data, local: form.local,
+    equipamento: form.equip, endereco: form.endereco, tipo: form.tipo, tag: form.tag,
+    obs_antes: form.obsAntes, obs_durante: form.obsDurante, obs_depois: form.obsDepois
+  }).eq('id', id);
+  if(errAt) throw errAt;
+  await removerFotosDoAtendimento(id);
+  await uploadFotos(id, photos);
+  return id;
 }
 
 // Busca todos os atendimentos + fotos (URLs públicas do bucket), mais recentes primeiro.
@@ -508,11 +537,11 @@ async function carregarAtendimentosSupabase(){
   if(errFotos) throw errFotos;
 
   return atendimentos.map(a=>{
-    const fotosDoAtendimento = fotos.filter(f=>f.atendimento_id===a.id).sort((x,y)=>x.ordem-y.ordem);
-    const porEtapa = { antes: [], durante: [], depois: [] };
+    const fotosDoAtendimento = fotos.filter(f=>f.atendimento_id===a.id);
+    const porEtapa = { antes: [null,null], durante: [null,null], depois: [null] };
     fotosDoAtendimento.forEach(f=>{
       const { data: pub } = sb.storage.from(FOTOS_BUCKET).getPublicUrl(f.storage_path);
-      porEtapa[f.etapa].push({ url: pub.publicUrl, storage_path: f.storage_path });
+      if(porEtapa[f.etapa]) porEtapa[f.etapa][f.ordem] = { url: pub.publicUrl, storage_path: f.storage_path };
     });
     return {
       id: a.id,
@@ -528,10 +557,7 @@ async function carregarAtendimentosSupabase(){
 }
 
 async function excluirAtendimentoSupabase(id){
-  const { data: fotos } = await sb.from('fotos').select('storage_path').eq('atendimento_id', id);
-  if(fotos && fotos.length){
-    await sb.storage.from(FOTOS_BUCKET).remove(fotos.map(f=>f.storage_path));
-  }
+  await removerFotosDoAtendimento(id);
   const { error } = await sb.from('atendimentos').delete().eq('id', id);
   if(error) throw error;
 }
@@ -739,6 +765,13 @@ document.getElementById('btnCompartilhar').addEventListener('click', async ()=>{
   showStatus('Este navegador não permite anexar o PDF direto no compartilhamento. O arquivo foi baixado — anexe-o manualmente no WhatsApp ou E-mail.', true);
 });
 
+function sairModoEdicao(){
+  state.editingId = null;
+  document.getElementById('editBanner').style.display = 'none';
+  document.getElementById('editBanner').innerHTML = '';
+  document.getElementById('btnSalvar').textContent = 'Salvar no histórico';
+}
+
 document.getElementById('btnLimpar').addEventListener('click', ()=>{
   ['f_base','f_local','f_equip','f_endereco','f_tipo','f_tag','obs_antes','obs_durante','obs_depois'].forEach(id=>{
     document.getElementById(id).value='';
@@ -746,8 +779,59 @@ document.getElementById('btnLimpar').addEventListener('click', ()=>{
   document.getElementById('f_data').value = todayISO();
   state.photos = { antes:[null,null], durante:[null,null], depois:[null] };
   ['antes','durante','depois'].forEach(renderPhotoRow);
+  sairModoEdicao();
   showStatus('Formulário limpo.');
 });
+
+// Carrega um atendimento salvo de volta no formulário pra edição.
+async function carregarParaEdicao(r){
+  if(!r) return;
+  document.querySelector('.tab-btn[data-tab="novo"]').click();
+  showStatus('Carregando relatório para edição...');
+  document.getElementById('f_tecnico').value = r.form.tecnico || '';
+  document.getElementById('f_base').value = r.form.base || '';
+  document.getElementById('f_data').value = r.form.data || todayISO();
+  document.getElementById('f_local').value = r.form.local || '';
+  document.getElementById('f_equip').value = r.form.equip || '';
+  document.getElementById('f_endereco').value = r.form.endereco || '';
+  document.getElementById('f_tipo').value = r.form.tipo || '';
+  document.getElementById('f_tag').value = r.form.tag || '';
+  document.getElementById('obs_antes').value = r.form.obsAntes || '';
+  document.getElementById('obs_durante').value = r.form.obsDurante || '';
+  document.getElementById('obs_depois').value = r.form.obsDepois || '';
+
+  const novasFotos = { antes:[null,null], durante:[null,null], depois:[null] };
+  const buscas = [];
+  ['antes','durante','depois'].forEach(etapa=>{
+    r.photos[etapa].forEach((p, idx)=>{
+      if(!p) return;
+      buscas.push((async ()=>{
+        const dataUrl = await urlToDataURL(p.url);
+        novasFotos[etapa][idx] = { full: dataUrl };
+      })());
+    });
+  });
+  try{
+    await Promise.all(buscas);
+  }catch(err){
+    console.error(err);
+    showStatus('Não foi possível carregar todas as fotos desse relatório.', true);
+  }
+  state.photos = novasFotos;
+  ['antes','durante','depois'].forEach(renderPhotoRow);
+
+  state.editingId = r.id;
+  const banner = document.getElementById('editBanner');
+  banner.className = 'edit-banner';
+  banner.style.display = 'flex';
+  banner.innerHTML = `<span>Editando o relatório Nº ${String(r.id).padStart(4,'0')}. Salvar vai atualizar esse mesmo relatório.</span><a id="cancelarEdicaoLink">Cancelar edição</a>`;
+  document.getElementById('cancelarEdicaoLink').addEventListener('click', ()=>{
+    document.getElementById('btnLimpar').click();
+  });
+  document.getElementById('btnSalvar').textContent = 'Salvar alterações';
+  window.scrollTo({top:0, behavior:'smooth'});
+  showStatus('Relatório carregado. Faça as alterações e clique em "Salvar alterações".');
+}
 
 // ---------- Save to shared history ----------
 document.getElementById('btnSalvar').addEventListener('click', async ()=>{
@@ -758,13 +842,19 @@ document.getElementById('btnSalvar').addEventListener('click', async ()=>{
   const btn = document.getElementById('btnSalvar');
   btn.disabled = true; const textoOriginal = btn.textContent; btn.textContent = 'Salvando...';
   try{
-    const seq = await salvarAtendimentoSupabase(form, state.photos);
-    showStatus(`Relatório Nº ${String(seq).padStart(4,'0')} salvo no banco de dados da equipe.`);
+    if(state.editingId){
+      const id = await atualizarAtendimentoSupabase(state.editingId, form, state.photos);
+      showStatus(`Relatório Nº ${String(id).padStart(4,'0')} atualizado com sucesso.`);
+      sairModoEdicao();
+    } else {
+      const seq = await salvarAtendimentoSupabase(form, state.photos);
+      showStatus(`Relatório Nº ${String(seq).padStart(4,'0')} salvo no banco de dados da equipe.`);
+    }
   }catch(err){
     console.error(err);
     showStatus('Falha ao salvar no banco. Verifique sua conexão e tente novamente.', true);
   }finally{
-    btn.disabled = false; btn.textContent = textoOriginal;
+    btn.disabled = false; btn.textContent = state.editingId ? 'Salvar alterações' : textoOriginal;
   }
 });
 
@@ -806,9 +896,13 @@ async function loadHistory(){
       </div>
       <div class="history-actions">
         <button class="btn btn-secondary" data-act="pdf" data-id="${r.id}">Baixar PDF</button>
+        <button class="btn btn-secondary" data-act="editar" data-id="${r.id}">Editar</button>
         <button class="btn btn-danger" data-act="del" data-id="${r.id}">Excluir</button>
       </div>`;
     list.appendChild(div);
+  });
+  list.querySelectorAll('[data-act="editar"]').forEach(btn=>{
+    btn.addEventListener('click', ()=> carregarParaEdicao(records.find(x=>String(x.id)===btn.dataset.id)));
   });
   list.querySelectorAll('[data-act="pdf"]').forEach(btn=>{
     btn.addEventListener('click', async ()=>{
