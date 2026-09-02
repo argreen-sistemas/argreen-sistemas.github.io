@@ -112,6 +112,8 @@
   .status.err{background:#fbeceb;color:var(--danger);}
   .edit-banner{font-size:13px;padding:10px 12px;border-radius:var(--radius);margin-bottom:14px;background:#fff6df;color:#7a5c00;display:flex;justify-content:space-between;align-items:center;gap:10px;}
   .edit-banner a{color:#7a5c00;text-decoration:underline;cursor:pointer;font-weight:600;white-space:nowrap;}
+  .pending-banner{font-size:13px;padding:10px 12px;border-radius:var(--radius);margin-bottom:14px;background:#e8f1fb;color:#1c4c7a;display:flex;justify-content:space-between;align-items:center;gap:10px;}
+  .pending-banner a{color:#1c4c7a;text-decoration:underline;cursor:pointer;font-weight:600;white-space:nowrap;}
 
   .history-item{
     border:1px solid var(--line);border-radius:6px;padding:12px 14px;margin-bottom:10px;
@@ -146,6 +148,7 @@
 
   <div id="statusBox"></div>
   <div id="editBanner" style="display:none;"></div>
+  <div id="pendentesBanner" style="display:none;"></div>
 
   <!-- NOVO RELATÓRIO -->
   <div id="tab-novo">
@@ -465,6 +468,105 @@ async function handlePhoto(e, stage, idx){
   }
   e.target.value = '';
 }
+
+// ---------- Suporte offline: registro do Service Worker ----------
+if('serviceWorker' in navigator){
+  window.addEventListener('load', ()=>{
+    navigator.serviceWorker.register('sw.js').catch(err=>console.error('Falha ao registrar service worker:', err));
+  });
+}
+
+// ---------- Suporte offline: fila local de relatórios não sincronizados ----------
+const IDB_NAME = 'relatorio_offline_db';
+const IDB_STORE = 'pendentes';
+
+function abrirDBOffline(){
+  return new Promise((resolve, reject)=>{
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = ()=>{
+      req.result.createObjectStore(IDB_STORE, { keyPath: 'localId' });
+    };
+    req.onsuccess = ()=> resolve(req.result);
+    req.onerror = ()=> reject(req.error);
+  });
+}
+
+async function salvarPendenteOffline(form, photos){
+  const db = await abrirDBOffline();
+  const localId = 'off_' + Date.now() + '_' + Math.random().toString(36).slice(2,8);
+  return new Promise((resolve,reject)=>{
+    const tx = db.transaction(IDB_STORE, 'readwrite');
+    tx.objectStore(IDB_STORE).put({ localId, form, photos, criadoEm: new Date().toISOString() });
+    tx.oncomplete = ()=> resolve(localId);
+    tx.onerror = ()=> reject(tx.error);
+  });
+}
+
+async function listarPendentesOffline(){
+  const db = await abrirDBOffline();
+  return new Promise((resolve,reject)=>{
+    const tx = db.transaction(IDB_STORE, 'readonly');
+    const req = tx.objectStore(IDB_STORE).getAll();
+    req.onsuccess = ()=> resolve(req.result);
+    req.onerror = ()=> reject(req.error);
+  });
+}
+
+async function removerPendenteOffline(localId){
+  const db = await abrirDBOffline();
+  return new Promise((resolve,reject)=>{
+    const tx = db.transaction(IDB_STORE, 'readwrite');
+    tx.objectStore(IDB_STORE).delete(localId);
+    tx.oncomplete = ()=> resolve();
+    tx.onerror = ()=> reject(tx.error);
+  });
+}
+
+function pareceErroDeRede(err){
+  if(!navigator.onLine) return true;
+  const msg = (err && (err.message || String(err))) || '';
+  return /fetch|network|Network|Failed to fetch/i.test(msg);
+}
+
+function atualizarBadgePendentes(qtd){
+  const banner = document.getElementById('pendentesBanner');
+  if(!qtd){ banner.style.display = 'none'; banner.innerHTML = ''; return; }
+  banner.className = 'pending-banner';
+  banner.style.display = 'flex';
+  banner.innerHTML = `<span>${qtd} relatório(s) aguardando conexão para sincronizar.</span><a id="sincronizarAgoraLink">Sincronizar agora</a>`;
+  document.getElementById('sincronizarAgoraLink').addEventListener('click', sincronizarPendentesOffline);
+}
+
+let sincronizandoAgora = false;
+async function sincronizarPendentesOffline(){
+  if(sincronizandoAgora) return;
+  if(!navigator.onLine) return;
+  sincronizandoAgora = true;
+  let pendentes;
+  try{ pendentes = await listarPendentesOffline(); }
+  catch(err){ console.error(err); sincronizandoAgora = false; return; }
+
+  let sincronizados = 0;
+  for(const p of pendentes){
+    try{
+      await salvarAtendimentoSupabase(p.form, p.photos);
+      await removerPendenteOffline(p.localId);
+      sincronizados++;
+    }catch(err){
+      console.error('Falha ao sincronizar pendente', p.localId, err);
+      break; // rede ainda instável — para e tenta de novo mais tarde
+    }
+  }
+  const restantes = await listarPendentesOffline().catch(()=>[]);
+  atualizarBadgePendentes(restantes.length);
+  if(sincronizados>0){
+    showStatus(`${sincronizados} relatório(s) pendente(s) sincronizado(s) com sucesso.`);
+    if(document.getElementById('tab-historico').style.display !== 'none'){ loadHistory(); }
+  }
+  sincronizandoAgora = false;
+}
+
+window.addEventListener('online', sincronizarPendentesOffline);
 
 // ---------- Supabase (banco de dados + fotos da equipe) ----------
 const SUPABASE_URL = 'https://qoxocixceqlouevhaofe.supabase.co';
@@ -857,6 +959,30 @@ document.getElementById('btnSalvar').addEventListener('click', async ()=>{
   if(!form.tecnico){ showStatus('Preencha o campo Técnico antes de salvar.', true); return; }
   const btn = document.getElementById('btnSalvar');
   btn.disabled = true; const textoOriginal = btn.textContent; btn.textContent = 'Salvando...';
+
+  // Edição sempre precisa de internet (já buscou as fotos originais online pra editar).
+  if(state.editingId && !navigator.onLine){
+    showStatus('Sem internet agora — edição de relatório precisa de conexão. Tente de novo quando o sinal voltar.', true);
+    btn.disabled = false; btn.textContent = 'Salvar alterações';
+    return;
+  }
+
+  // Sem internet e é um relatório novo: guarda localmente no aparelho pra sincronizar depois.
+  if(!state.editingId && !navigator.onLine){
+    try{
+      await salvarPendenteOffline(form, state.photos);
+      showStatus('Sem internet agora — relatório guardado neste aparelho e será enviado automaticamente quando a conexão voltar.');
+      document.getElementById('btnLimpar').click();
+      const pendentes = await listarPendentesOffline();
+      atualizarBadgePendentes(pendentes.length);
+    }catch(err){
+      console.error(err);
+      showStatus('Não consegui guardar o relatório localmente. Tente novamente.', true);
+    }
+    btn.disabled = false; btn.textContent = textoOriginal;
+    return;
+  }
+
   try{
     if(state.editingId){
       const id = await atualizarAtendimentoSupabase(state.editingId, form, state.photos);
@@ -868,7 +994,20 @@ document.getElementById('btnSalvar').addEventListener('click', async ()=>{
     }
   }catch(err){
     console.error(err);
-    showStatus('Falha ao salvar no banco. Verifique sua conexão e tente novamente.', true);
+    if(!state.editingId && pareceErroDeRede(err)){
+      try{
+        await salvarPendenteOffline(form, state.photos);
+        showStatus('Não consegui conectar agora — relatório guardado neste aparelho e será enviado quando a conexão voltar.');
+        document.getElementById('btnLimpar').click();
+        const pendentes = await listarPendentesOffline();
+        atualizarBadgePendentes(pendentes.length);
+      }catch(err2){
+        console.error(err2);
+        showStatus('Falha ao salvar no banco e ao guardar localmente. Tente novamente.', true);
+      }
+    } else {
+      showStatus(state.editingId ? 'Falha ao atualizar. Verifique sua conexão e tente novamente.' : 'Falha ao salvar no banco. Verifique sua conexão e tente novamente.', true);
+    }
   }finally{
     btn.disabled = false; btn.textContent = state.editingId ? 'Salvar alterações' : textoOriginal;
   }
@@ -1079,6 +1218,18 @@ document.getElementById('btnExportarLimpar').addEventListener('click', async ()=
   setExportLimparStatus(msgFinal, falhas.length>0 || errosApagar>0);
   loadHistory();
 });
+
+// Ao abrir a página: mostra quantos relatórios estão pendentes de sincronizar
+// e, se já tiver internet, tenta enviar na hora.
+(async ()=>{
+  try{
+    const pendentes = await listarPendentesOffline();
+    atualizarBadgePendentes(pendentes.length);
+    if(pendentes.length && navigator.onLine){ sincronizarPendentesOffline(); }
+  }catch(err){
+    console.error('Falha ao checar pendentes offline:', err);
+  }
+})();
 </script>
 </body>
 </html>
