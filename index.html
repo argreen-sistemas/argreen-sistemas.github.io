@@ -11,6 +11,7 @@
 <meta name="apple-mobile-web-app-title" content="Atendimento ARgreen">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
 <style>
   :root{
@@ -211,6 +212,20 @@
       </div>
       <div id="historyList"></div>
     </div>
+
+    <div class="panel" style="border:1.5px solid #e8c46a;background:#fffaf0;">
+      <div class="section-label" style="color:#8a6300;border-bottom-color:#e8c46a;">Exportar e limpar (economizar espaço no banco)</div>
+      <div class="hint" style="margin-top:0;margin-bottom:12px;">
+        Baixa em um único arquivo ZIP o PDF de todos os relatórios salvos num dia, e em seguida apaga esses relatórios (e as fotos) do banco de dados — pra manter o Storage do Supabase enxuto. Guarde o ZIP baixado em algum lugar seguro (Google Drive, computador da base etc.), porque depois de apagado não tem como recuperar por aqui.
+      </div>
+      <div class="grid2" style="margin-bottom:12px;">
+        <div class="field"><label>Data dos relatórios a exportar e apagar</label><input type="date" id="dataExportLimpar"></div>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-primary" id="btnExportarLimpar" style="background:#8a6300;border-color:#8a6300;">Exportar (ZIP) e apagar do banco</button>
+      </div>
+      <div id="exportLimparStatus" style="margin-top:10px;"></div>
+    </div>
   </div>
 
 </div>
@@ -231,6 +246,7 @@ const state = {
 
 function todayISO(){ return new Date().toISOString().slice(0,10); }
 document.getElementById('f_data').value = todayISO();
+document.getElementById('dataExportLimpar').value = todayISO();
 
 // Lembra o nome do técnico neste aparelho (não precisa digitar toda vez).
 const savedTecnico = localStorage.getItem('tecnico_nome');
@@ -976,6 +992,92 @@ document.getElementById('btnExportXlsx').addEventListener('click', async ()=>{
   a.href = url; a.download = 'atendimentos.xlsx'; document.body.appendChild(a); a.click(); a.remove();
   setTimeout(()=>URL.revokeObjectURL(url), 3000);
   showStatus('Excel exportado (dados dos relatórios, sem fotos).');
+});
+
+// ---------- Exportar (ZIP) e apagar do banco, por data ----------
+function setExportLimparStatus(msg, isErr){
+  const box = document.getElementById('exportLimparStatus');
+  box.innerHTML = msg ? `<div class="status ${isErr?'err':'ok'}">${msg}</div>` : '';
+}
+
+document.getElementById('btnExportarLimpar').addEventListener('click', async ()=>{
+  const dataAlvo = document.getElementById('dataExportLimpar').value;
+  if(!dataAlvo){ setExportLimparStatus('Escolha uma data.', true); return; }
+  const btn = document.getElementById('btnExportarLimpar');
+
+  let todos;
+  try{
+    todos = await carregarAtendimentosSupabase();
+  }catch(err){
+    console.error(err);
+    setExportLimparStatus('Não foi possível carregar os relatórios.', true);
+    return;
+  }
+  const doDia = todos.filter(r => (r.savedAt||'').slice(0,10) === dataAlvo);
+  if(!doDia.length){ setExportLimparStatus(`Nenhum relatório salvo em ${fmtDateBR(dataAlvo)}.`, true); return; }
+
+  const confirmado = confirm(
+    `Isso vai baixar ${doDia.length} relatório(s) de ${fmtDateBR(dataAlvo)} num arquivo ZIP e depois APAGAR esses relatórios (dados + fotos) do banco de dados, sem volta.\n\nSó apaga o que foi baixado com sucesso no ZIP. Confirma?`
+  );
+  if(!confirmado) return;
+
+  btn.disabled = true;
+  const zip = new JSZip();
+  const sucesso = [];
+  const falhas = [];
+
+  for(let i=0; i<doDia.length; i++){
+    const r = doDia[i];
+    setExportLimparStatus(`Gerando PDF ${i+1} de ${doDia.length} (Nº ${String(r.id).padStart(4,'0')})...`);
+    try{
+      const toDataUrls = async (arr)=> Promise.all(arr.map(async p=> p? {full: await urlToDataURL(p.url)} : null));
+      const photosForPdf = {
+        antes: await toDataUrls(r.photos.antes),
+        durante: await toDataUrls(r.photos.durante),
+        depois: await toDataUrls(r.photos.depois)
+      };
+      const doc = buildPdf(r.form, photosForPdf, state.logos);
+      const blob = doc.output('blob');
+      const nome = `Nº${String(r.id).padStart(4,'0')}_${(r.form.base||'atendimento').replace(/\s+/g,'_')}_${r.form.tecnico||''}.pdf`.replace(/[\\/:*?"<>|]/g,'');
+      zip.file(nome, blob);
+      sucesso.push(r.id);
+    }catch(err){
+      console.error('Falha ao gerar PDF do relatório', r.id, err);
+      falhas.push(r.id);
+    }
+  }
+
+  if(!sucesso.length){
+    btn.disabled = false;
+    setExportLimparStatus('Não consegui gerar nenhum PDF. Nada foi apagado. Verifique sua conexão e tente novamente.', true);
+    return;
+  }
+
+  setExportLimparStatus('Montando o arquivo ZIP...');
+  const zipBlob = await zip.generateAsync({type:'blob'});
+  const zipUrl = URL.createObjectURL(zipBlob);
+  const a = document.createElement('a');
+  a.href = zipUrl; a.download = `Relatorios_${dataAlvo}.zip`; document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=>URL.revokeObjectURL(zipUrl), 5000);
+
+  setExportLimparStatus(`Apagando ${sucesso.length} relatório(s) já salvos no ZIP...`);
+  let apagados = 0, errosApagar = 0;
+  for(const id of sucesso){
+    try{
+      await excluirAtendimentoSupabase(id);
+      apagados++;
+    }catch(err){
+      console.error('Falha ao apagar relatório', id, err);
+      errosApagar++;
+    }
+  }
+
+  btn.disabled = false;
+  let msgFinal = `ZIP baixado com ${sucesso.length} relatório(s). ${apagados} apagado(s) do banco.`;
+  if(falhas.length) msgFinal += ` ${falhas.length} não entraram no ZIP (não foram apagados).`;
+  if(errosApagar) msgFinal += ` ${errosApagar} não puderam ser apagados — tente de novo depois.`;
+  setExportLimparStatus(msgFinal, falhas.length>0 || errosApagar>0);
+  loadHistory();
 });
 </script>
 </body>
