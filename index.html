@@ -572,7 +572,11 @@ window.addEventListener('online', sincronizarPendentesOffline);
 const SUPABASE_URL = 'https://qoxocixceqlouevhaofe.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFveG9jaXhjZXFsb3Vldmhhb2ZlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODgyODk2MDIsImV4cCI6MjEwMzg2NTYwMn0.TN9n0MsWGWa_l4_Si_VrDuXvSP0HgBMZOceb9kto5jE';
 const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-const FOTOS_BUCKET = 'fotos-atendimento';
+
+// Fotos agora ficam no Cloudflare R2 (armazenamento praticamente gratuito no
+// volume da equipe). O banco (Supabase) só guarda o caminho de cada foto.
+const R2_PUBLIC_URL = 'https://pub-9d3c2e929c634f8e9f0b349bd07dbdf9.r2.dev';
+const R2_WORKER_URL = 'https://fotos-atendimento-upload.dailson79459.workers.dev';
 
 function dataUrlToBlob(dataUrl){
   const [meta, b64] = dataUrl.split(',');
@@ -595,7 +599,7 @@ async function urlToDataURL(url){
 }
 
 // Salva um atendimento completo: cria a linha em "atendimentos" (o id vira o
-// número sequencial), sobe cada foto pro bucket e registra em "fotos".
+// número sequencial), sobe cada foto pro R2 (via Worker) e registra o caminho em "fotos".
 async function uploadFotos(atendimentoId, photos){
   const uploads = [];
   ['antes','durante','depois'].forEach(etapa=>{
@@ -604,8 +608,12 @@ async function uploadFotos(atendimentoId, photos){
       uploads.push((async ()=>{
         const path = `${atendimentoId}/${etapa}_${idx}_${Date.now()}.jpg`;
         const blob = dataUrlToBlob(p.full);
-        const { error: errUp } = await sb.storage.from(FOTOS_BUCKET).upload(path, blob, { contentType:'image/jpeg', upsert:true });
-        if(errUp) throw errUp;
+        const resp = await fetch(`${R2_WORKER_URL}/fotos/${encodeURIComponent(path)}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'image/jpeg' },
+          body: blob
+        });
+        if(!resp.ok) throw new Error('Falha ao enviar foto para o R2 (status ' + resp.status + ')');
         const { error: errFoto } = await sb.from('fotos').insert({ atendimento_id: atendimentoId, etapa, ordem: idx, storage_path: path });
         if(errFoto) throw errFoto;
       })());
@@ -617,7 +625,10 @@ async function uploadFotos(atendimentoId, photos){
 async function removerFotosDoAtendimento(id){
   const { data: fotos } = await sb.from('fotos').select('storage_path').eq('atendimento_id', id);
   if(fotos && fotos.length){
-    await sb.storage.from(FOTOS_BUCKET).remove(fotos.map(f=>f.storage_path));
+    await Promise.all(fotos.map(f =>
+      fetch(`${R2_WORKER_URL}/fotos/${encodeURIComponent(f.storage_path)}`, { method: 'DELETE' })
+        .catch(err => console.error('Falha ao apagar foto do R2:', f.storage_path, err))
+    ));
   }
   await sb.from('fotos').delete().eq('atendimento_id', id);
 }
@@ -658,8 +669,8 @@ async function carregarAtendimentosSupabase(){
     const fotosDoAtendimento = fotos.filter(f=>f.atendimento_id===a.id);
     const porEtapa = { antes: [null,null], durante: [null,null], depois: [null] };
     fotosDoAtendimento.forEach(f=>{
-      const { data: pub } = sb.storage.from(FOTOS_BUCKET).getPublicUrl(f.storage_path);
-      if(porEtapa[f.etapa]) porEtapa[f.etapa][f.ordem] = { url: pub.publicUrl, storage_path: f.storage_path };
+      const publicUrl = `${R2_PUBLIC_URL}/${f.storage_path}`;
+      if(porEtapa[f.etapa]) porEtapa[f.etapa][f.ordem] = { url: publicUrl, storage_path: f.storage_path };
     });
     return {
       id: a.id,
