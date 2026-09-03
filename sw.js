@@ -1,7 +1,7 @@
 // Service Worker do Relatório de Atendimento — permite abrir o app e usar as
 // funções que não dependem de rede (preencher, tirar foto, gerar PDF) mesmo
 // sem internet, depois da primeira visita com sinal.
-const CACHE_NAME = 'relatorio-atendimento-v1';
+const CACHE_NAME = 'relatorio-atendimento-v2';
 const ASSETS = [
   './',
   './index.html',
@@ -28,11 +28,13 @@ self.addEventListener('activate', (event) => {
   );
 });
 
-// Só cuida de pedidos GET. Chamadas pro Supabase (dados/fotos da equipe)
-// sempre precisam de rede de verdade — o service worker não mexe nelas.
+// Só cuida de pedidos GET. Chamadas pro Supabase (dados da equipe) e pro R2/
+// Worker (fotos) sempre precisam de rede de verdade e de CORS intacto — o
+// service worker não deve interceptar essas, só os arquivos do próprio app.
 self.addEventListener('fetch', (event) => {
   if (event.request.method !== 'GET') return;
-  if (event.request.url.includes('supabase.co')) return;
+  const url = event.request.url;
+  if (url.includes('supabase.co') || url.includes('.r2.dev') || url.includes('.workers.dev')) return;
 
   event.respondWith(
     caches.match(event.request).then((cached) => {
