@@ -587,13 +587,24 @@ function dataUrlToBlob(dataUrl){
   return new Blob([arr], {type: mime});
 }
 
-// Baixa uma foto e devolve como data URL. Confere se a resposta veio certa e
-// tenta de novo (até 4 vezes, com espera crescente) se o R2 falhar ou limitar o acesso.
+// Baixa uma foto e devolve como data URL. Tenta alternando duas rotas:
+// 1) pelo Worker (sempre devolve a foto com CORS correto) e
+// 2) pelo link público do R2 com um parâmetro extra, que evita pegar uma cópia
+//    em cache sem autorização de CORS. Confere a resposta e tenta de novo (até 4 vezes).
 async function urlToDataURL(url, tentativas = 4){
+  let rotas = [url];
+  if(url.startsWith(R2_PUBLIC_URL + '/')){
+    const caminho = url.slice(R2_PUBLIC_URL.length + 1);
+    rotas = [
+      `${R2_WORKER_URL}/fotos/${encodeURIComponent(caminho)}`,
+      `${url}?cors=1`
+    ];
+  }
   let ultimoErro;
   for(let i=0; i<tentativas; i++){
+    const rota = rotas[i % rotas.length];
     try{
-      const res = await fetch(url);
+      const res = await fetch(rota);
       if(!res.ok) throw new Error('HTTP ' + res.status);
       const blob = await res.blob();
       if(!blob.type.startsWith('image/')) throw new Error('Resposta não é uma imagem (' + blob.type + ')');
@@ -1259,6 +1270,6 @@ document.getElementById('btnExportarLimpar').addEventListener('click', async ()=
 })();
 </script>
 <div id="versaoApp" style="text-align:center;font-size:11px;color:#9a9a9a;padding:16px 0 24px;"></div>
-<script>document.getElementById('versaoApp').textContent = 'versão 2026-10-19b';</script>
+<script>document.getElementById('versaoApp').textContent = 'versão 2026-10-19c';</script>
 </body>
 </html>
