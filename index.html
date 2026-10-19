@@ -1104,7 +1104,8 @@ async function loadHistory(){
         setTimeout(()=>URL.revokeObjectURL(url), 3000);
       }catch(err){
         console.error(err);
-        showStatus('Não foi possível gerar o PDF desse relatório.', true);
+        const detalhe = (err && err.message) ? err.message : String(err);
+        showStatus('Não foi possível gerar o PDF desse relatório. Detalhe técnico: ' + detalhe, true);
       }finally{
         btn.disabled = false; btn.textContent = original;
       }
@@ -1188,6 +1189,7 @@ document.getElementById('btnExportarLimpar').addEventListener('click', async ()=
   const zip = new JSZip();
   const sucesso = [];
   const falhas = [];
+  let primeiroErro = '';
 
   for(let i=0; i<doDia.length; i++){
     const r = doDia[i];
@@ -1206,13 +1208,14 @@ document.getElementById('btnExportarLimpar').addEventListener('click', async ()=
       sucesso.push(r.id);
     }catch(err){
       console.error('Falha ao gerar PDF do relatório', r.id, err);
+      if(!primeiroErro){ primeiroErro = (err && err.message) ? err.message : String(err); }
       falhas.push(r.id);
     }
   }
 
   if(!sucesso.length){
     btn.disabled = false;
-    setExportLimparStatus('Não consegui gerar nenhum PDF. Nada foi apagado. Verifique sua conexão e tente novamente.', true);
+    setExportLimparStatus('Não consegui gerar nenhum PDF. Nada foi apagado. Detalhe técnico: ' + primeiroErro, true);
     return;
   }
 
@@ -1255,5 +1258,7 @@ document.getElementById('btnExportarLimpar').addEventListener('click', async ()=
   }
 })();
 </script>
+<div id="versaoApp" style="text-align:center;font-size:11px;color:#9a9a9a;padding:16px 0 24px;"></div>
+<script>document.getElementById('versaoApp').textContent = 'versão 2026-10-19b';</script>
 </body>
 </html>
