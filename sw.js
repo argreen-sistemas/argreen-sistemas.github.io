@@ -1,7 +1,7 @@
 // Service Worker do Relatório de Atendimento — permite abrir o app e usar as
 // funções que não dependem de rede (preencher, tirar foto, gerar PDF) mesmo
 // sem internet, depois da primeira visita com sinal.
-const CACHE_NAME = 'relatorio-atendimento-v2';
+const CACHE_NAME = 'relatorio-atendimento-v3';
 const ASSETS = [
   './',
   './index.html',
@@ -36,6 +36,13 @@ self.addEventListener('fetch', (event) => {
   const url = event.request.url;
   if (url.includes('supabase.co') || url.includes('.r2.dev') || url.includes('.workers.dev')) return;
 
+  // Página principal: tenta a internet primeiro (pega atualizações na hora) e só
+  // usa a cópia guardada se estiver sem sinal ou se a rede demorar mais de 4 segundos.
+  if (event.request.mode === 'navigate') {
+    event.respondWith(networkFirst(event.request));
+    return;
+  }
+
   event.respondWith(
     caches.match(event.request).then((cached) => {
       const fetchAndUpdate = fetch(event.request)
@@ -49,3 +56,28 @@ self.addEventListener('fetch', (event) => {
     })
   );
 });
+
+function networkFirst(request) {
+  return new Promise((resolve) => {
+    let respondido = false;
+    const timer = setTimeout(() => {
+      caches.match(request).then((cached) => {
+        if (cached && !respondido) { respondido = true; resolve(cached); }
+      });
+    }, 4000);
+
+    fetch(request)
+      .then((resp) => {
+        clearTimeout(timer);
+        const clone = resp.clone();
+        caches.open(CACHE_NAME).then((cache) => cache.put(request, clone));
+        if (!respondido) { respondido = true; resolve(resp); }
+      })
+      .catch(() => {
+        clearTimeout(timer);
+        caches.match(request).then((cached) => {
+          if (!respondido) { respondido = true; resolve(cached || Response.error()); }
+        });
+      });
+  });
+}
