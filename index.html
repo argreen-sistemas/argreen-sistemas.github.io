@@ -587,15 +587,28 @@ function dataUrlToBlob(dataUrl){
   return new Blob([arr], {type: mime});
 }
 
-async function urlToDataURL(url){
-  const res = await fetch(url);
-  const blob = await res.blob();
-  return new Promise((resolve, reject)=>{
-    const reader = new FileReader();
-    reader.onload = ()=>resolve(reader.result);
-    reader.onerror = reject;
-    reader.readAsDataURL(blob);
-  });
+// Baixa uma foto e devolve como data URL. Confere se a resposta veio certa e
+// tenta de novo (até 4 vezes, com espera crescente) se o R2 falhar ou limitar o acesso.
+async function urlToDataURL(url, tentativas = 4){
+  let ultimoErro;
+  for(let i=0; i<tentativas; i++){
+    try{
+      const res = await fetch(url);
+      if(!res.ok) throw new Error('HTTP ' + res.status);
+      const blob = await res.blob();
+      if(!blob.type.startsWith('image/')) throw new Error('Resposta não é uma imagem (' + blob.type + ')');
+      return await new Promise((resolve, reject)=>{
+        const reader = new FileReader();
+        reader.onload = ()=>resolve(reader.result);
+        reader.onerror = reject;
+        reader.readAsDataURL(blob);
+      });
+    }catch(err){
+      ultimoErro = err;
+      if(i < tentativas-1){ await new Promise(r=>setTimeout(r, 700*(i+1))); }
+    }
+  }
+  throw ultimoErro;
 }
 
 // Salva um atendimento completo: cria a linha em "atendimentos" (o id vira o
