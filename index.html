@@ -137,6 +137,7 @@
     <div class="brand">
       <div class="brand-title">Relatório de Atendimento</div>
       <div class="brand-sub">Evidência fotográfica — Antes / Durante / Depois</div>
+      <div id="unidadeLabel" style="display:none;margin-top:4px;font-size:12px;font-weight:700;color:var(--green-dark);"></div>
     </div>
     <img class="topbar-logo" id="topbarLogoRight" alt="BRAVA">
   </div>
@@ -217,7 +218,7 @@
       <div id="historyList"></div>
     </div>
 
-    <div class="panel" style="border:1.5px solid #e8c46a;background:#fffaf0;">
+    <div class="panel" id="painelExportarLimpar" style="border:1.5px solid #e8c46a;background:#fffaf0;">
       <div class="section-label" style="color:#8a6300;border-bottom-color:#e8c46a;">Exportar e limpar (economizar espaço no banco)</div>
       <div class="hint" style="margin-top:0;margin-bottom:12px;">
         Baixa em um único arquivo ZIP o PDF de todos os relatórios salvos num dia, e em seguida apaga esses relatórios (e as fotos) do banco de dados — pra manter o Storage do Supabase enxuto. Guarde o ZIP baixado em algum lugar seguro (Google Drive, computador da base etc.), porque depois de apagado não tem como recuperar por aqui.
@@ -480,6 +481,19 @@ if('serviceWorker' in navigator){
 }
 
 // ---------- Suporte offline: fila local de relatórios não sincronizados ----------
+// ---------- Chave da unidade (cada link tem a sua) ----------
+// O link de cada unidade termina com #k=CHAVE. A chave fica guardada neste aparelho,
+// vai em todos os pedidos ao banco, e o banco só devolve os relatórios dessa unidade.
+const CHAVE_UNIDADE = (function(){
+  try{
+    const m = location.hash.match(/[#&]k=([A-Za-z0-9_-]+)/);
+    if(m){ localStorage.setItem('chave_unidade', m[1]); }
+    return localStorage.getItem('chave_unidade') || '';
+  }catch(e){ return ''; }
+})();
+let UNIDADE_INFO = null;
+const NOMES_UNIDADES = { mossoro: 'Mossoró', macau: 'Alto do Rodrigues/Macau' };
+
 const IDB_NAME = 'relatorio_offline_db';
 const IDB_STORE = 'pendentes';
 const RASCUNHO_STORE = 'rascunho';
@@ -506,7 +520,7 @@ async function salvarPendenteOffline(form, photos){
   const localId = 'off_' + Date.now() + '_' + Math.random().toString(36).slice(2,8);
   return new Promise((resolve,reject)=>{
     const tx = db.transaction(IDB_STORE, 'readwrite');
-    tx.objectStore(IDB_STORE).put({ localId, form, photos, criadoEm: new Date().toISOString() });
+    tx.objectStore(IDB_STORE).put({ localId, form, photos, chave: CHAVE_UNIDADE, criadoEm: new Date().toISOString() });
     tx.oncomplete = ()=> resolve(localId);
     tx.onerror = ()=> reject(tx.error);
   });
@@ -517,7 +531,8 @@ async function listarPendentesOffline(){
   return new Promise((resolve,reject)=>{
     const tx = db.transaction(IDB_STORE, 'readonly');
     const req = tx.objectStore(IDB_STORE).getAll();
-    req.onsuccess = ()=> resolve(req.result);
+    // só os itens desta unidade (itens antigos, sem chave, valem para a unidade atual)
+    req.onsuccess = ()=> resolve((req.result || []).filter(p => !p.chave || p.chave === CHAVE_UNIDADE));
     req.onerror = ()=> reject(req.error);
   });
 }
@@ -602,7 +617,7 @@ async function gravarRascunhoAgora(){
     await new Promise((resolve, reject)=>{
       const tx = db.transaction(RASCUNHO_STORE, 'readwrite');
       if(temConteudoRascunho(form, photos)){
-        tx.objectStore(RASCUNHO_STORE).put({ id: 'atual', form, photos, atualizadoEm: new Date().toISOString() });
+        tx.objectStore(RASCUNHO_STORE).put({ id: 'atual', form, photos, chave: CHAVE_UNIDADE, atualizadoEm: new Date().toISOString() });
       } else {
         tx.objectStore(RASCUNHO_STORE).delete('atual');
       }
@@ -664,7 +679,8 @@ function mostrarBannerRascunho(){
 // ---------- Supabase (banco de dados + fotos da equipe) ----------
 const SUPABASE_URL = 'https://qoxocixceqlouevhaofe.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFveG9jaXhjZXFsb3Vldmhhb2ZlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODgyODk2MDIsImV4cCI6MjEwMzg2NTYwMn0.TN9n0MsWGWa_l4_Si_VrDuXvSP0HgBMZOceb9kto5jE';
-const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY,
+  CHAVE_UNIDADE ? { global: { headers: { 'x-unidade-chave': CHAVE_UNIDADE } } } : undefined);
 
 // Fotos agora ficam no Cloudflare R2 (armazenamento praticamente gratuito no
 // volume da equipe). O banco (Supabase) só guarda o caminho de cada foto.
@@ -764,12 +780,13 @@ async function salvarAtendimentoSupabase(form, photos){
 // Atualiza um atendimento já salvo: troca os dados e substitui todas as fotos
 // pelo conjunto atual (mais simples e sem risco de duplicar/perder foto).
 async function atualizarAtendimentoSupabase(id, form, photos){
-  const { error: errAt } = await sb.from('atendimentos').update({
+  const { data: atualizados, error: errAt } = await sb.from('atendimentos').update({
     tecnico: form.tecnico, base: form.base, data: form.data, local: form.local,
     equipamento: form.equip, endereco: form.endereco, tipo: form.tipo, tag: form.tag,
     obs_antes: form.obsAntes, obs_durante: form.obsDurante, obs_depois: form.obsDepois
-  }).eq('id', id);
+  }).eq('id', id).select('id');
   if(errAt) throw errAt;
+  if(!atualizados || !atualizados.length) throw new Error('Sem permissão para alterar este relatório');
   await removerFotosDoAtendimento(id);
   await uploadFotos(id, photos);
   return id;
@@ -795,7 +812,7 @@ async function carregarAtendimentosSupabase(){
       form: {
         tecnico: a.tecnico, base: a.base, data: a.data, local: a.local, equip: a.equipamento,
         endereco: a.endereco, tipo: a.tipo, tag: a.tag, obsAntes: a.obs_antes,
-        obsDurante: a.obs_durante, obsDepois: a.obs_depois, seq: a.id
+        obsDurante: a.obs_durante, obsDepois: a.obs_depois, seq: a.id, unidade: a.unidade
       },
       photos: porEtapa
     };
@@ -803,9 +820,17 @@ async function carregarAtendimentosSupabase(){
 }
 
 async function excluirAtendimentoSupabase(id){
-  await removerFotosDoAtendimento(id);
-  const { error } = await sb.from('atendimentos').delete().eq('id', id);
+  const { data: fotos } = await sb.from('fotos').select('storage_path').eq('atendimento_id', id);
+  const { data: apagados, error } = await sb.from('atendimentos').delete().eq('id', id).select('id');
   if(error) throw error;
+  if(!apagados || !apagados.length) throw new Error('Sem permissão para apagar este relatório');
+  // o banco confirmou (as linhas de fotos saem junto, em cascata): agora apaga os arquivos no R2
+  if(fotos && fotos.length){
+    await Promise.all(fotos.map(f =>
+      fetch(`${R2_WORKER_URL}/fotos/${encodeURIComponent(f.storage_path)}`, { method: 'DELETE' })
+        .catch(err => console.error('Falha ao apagar foto do R2:', f.storage_path, err))
+    ));
+  }
 }
 
 // ---------- PDF generation ----------
@@ -1176,16 +1201,18 @@ async function loadHistory(){
     const div = document.createElement('div');
     div.className = 'history-item';
     const seqTag = r.form.seq ? `Nº ${String(r.form.seq).padStart(4,'0')} · ` : '';
+    const somenteLeitura = !!(UNIDADE_INFO && UNIDADE_INFO.admin);
+    const unidTag = somenteLeitura ? `[${NOMES_UNIDADES[r.form.unidade] || r.form.unidade}] ` : '';
     div.innerHTML = `
       <div class="history-info">
-        <b>${seqTag}${r.form.base||'—'} · ${r.form.local||'—'}</b>
+        <b>${unidTag}${seqTag}${r.form.base||'—'} · ${r.form.local||'—'}</b>
         <div>${r.form.tecnico?('Técnico: '+r.form.tecnico+' · '):''}${fmtDateBR(r.form.data)}${r.form.equip?(' · '+r.form.equip):''}${r.form.tag?(' · TAG '+r.form.tag):''}</div>
         <div class="history-thumbs">${thumbs.map(t=>`<img src="${t.url}">`).join('')}</div>
       </div>
       <div class="history-actions">
         <button class="btn btn-secondary" data-act="pdf" data-id="${r.id}">Baixar PDF</button>
-        <button class="btn btn-secondary" data-act="editar" data-id="${r.id}">Editar</button>
-        <button class="btn btn-danger" data-act="del" data-id="${r.id}">Excluir</button>
+        ${somenteLeitura ? '' : `<button class="btn btn-secondary" data-act="editar" data-id="${r.id}">Editar</button>
+        <button class="btn btn-danger" data-act="del" data-id="${r.id}">Excluir</button>`}
       </div>`;
     list.appendChild(div);
   });
@@ -1249,6 +1276,7 @@ document.getElementById('btnExportXlsx').addEventListener('click', async ()=>{
   if(!records.length){ showStatus('Não há relatórios para exportar.', true); return; }
   const rows = records.map(r=>({
     'Nº': r.form.seq ? String(r.form.seq).padStart(4,'0') : '',
+    'Unidade': NOMES_UNIDADES[r.form.unidade] || r.form.unidade || '',
     'Técnico': r.form.tecnico || '',
     'Base': r.form.base, 'Data': fmtDateBR(r.form.data), 'Local': r.form.local,
     'Equipamento': r.form.equip, 'Endereço': r.form.endereco, 'Tipo de Serviço': r.form.tipo, 'TAG': r.form.tag,
@@ -1367,6 +1395,40 @@ document.getElementById('btnExportarLimpar').addEventListener('click', async ()=
   }
 })();
 
+// Identifica a unidade deste link (nome no cabeçalho). Link sem chave válida fica bloqueado.
+function bloquearSemUnidade(){
+  const tela = document.createElement('div');
+  tela.style.cssText = 'position:fixed;inset:0;z-index:9999;background:#fbfaf7;display:flex;align-items:center;justify-content:center;padding:24px;text-align:center;font-family:inherit;';
+  tela.innerHTML = '<div style="max-width:420px;"><div style="font-size:20px;font-weight:700;margin-bottom:10px;">Link não autorizado</div><div style="font-size:15px;line-height:1.5;color:#555;">Este endereço não está ligado a nenhuma unidade. Peça ao responsável o link da sua unidade e abra-o neste aparelho.</div></div>';
+  document.body.appendChild(tela);
+}
+
+(async ()=>{
+  const label = document.getElementById('unidadeLabel');
+  try{
+    const { data, error } = await sb.rpc('minha_unidade');
+    if(error) throw error;
+    if(!data){ bloquearSemUnidade(); return; }
+    // tem chave no aparelho mas o banco respondeu como "sem chave": a chave não chegou ao
+    // servidor. Bloqueia para nunca gravar relatório na unidade errada.
+    if(CHAVE_UNIDADE && data.legado){ bloquearSemUnidade(); return; }
+    UNIDADE_INFO = data;
+    try{ localStorage.setItem('unidade_nome', data.nome); }catch(e){}
+    label.textContent = data.admin ? 'Administrador — somente leitura (todas as unidades)' : ('Unidade: ' + data.nome);
+    label.style.display = 'block';
+    if(data.admin){
+      document.querySelector('.tab-btn[data-tab="novo"]').style.display = 'none';
+      document.getElementById('painelExportarLimpar').style.display = 'none';
+      document.querySelector('.tab-btn[data-tab="historico"]').click();
+    }
+  }catch(err){
+    // sem internet ou erro de rede: mostra a última unidade conhecida, sem bloquear
+    let salvo = '';
+    try{ salvo = localStorage.getItem('unidade_nome') || ''; }catch(e){}
+    if(salvo){ label.textContent = 'Unidade: ' + salvo; label.style.display = 'block'; }
+  }
+})();
+
 // Rascunho: ouve alterações no formulário, grava ao travar/sair e restaura ao abrir.
 (function(){
   const aba = document.getElementById('tab-novo');
@@ -1384,7 +1446,7 @@ document.getElementById('btnExportarLimpar').addEventListener('click', async ()=
     const r = await lerRascunho();
     // se o técnico já começou a tirar fotos nesta aba antes do banco local abrir, não sobrescreve
     const jaTemFoto = ['antes','durante','depois'].some(s => state.photos[s].some(Boolean));
-    if(r && r.form && !jaTemFoto){
+    if(r && r.form && !jaTemFoto && (!r.chave || r.chave === CHAVE_UNIDADE)){
       CAMPOS_RASCUNHO.forEach(id=>{
         const v = r.form[id];
         if((id === 'f_tecnico' || id === 'f_data') && !v) return;
@@ -1407,6 +1469,6 @@ document.getElementById('btnExportarLimpar').addEventListener('click', async ()=
 })();
 </script>
 <div id="versaoApp" style="text-align:center;font-size:11px;color:#9a9a9a;padding:16px 0 24px;"></div>
-<script>document.getElementById('versaoApp').textContent = 'versão 2026-10-21a';</script>
+<script>document.getElementById('versaoApp').textContent = 'versão 2026-10-21b';</script>
 </body>
 </html>
