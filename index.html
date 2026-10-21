@@ -149,6 +149,7 @@
   <div id="statusBox"></div>
   <div id="editBanner" style="display:none;"></div>
   <div id="pendentesBanner" style="display:none;"></div>
+  <div id="rascunhoBanner" style="display:none;"></div>
 
   <!-- NOVO RELATÓRIO -->
   <div id="tab-novo">
@@ -313,6 +314,7 @@ function renderPhotoRow(stage){
       const {stage, idx} = b.dataset;
       state.photos[stage][idx] = null;
       renderPhotoRow(stage);
+      gravarRascunhoAgora();
     });
   });
 }
@@ -463,6 +465,7 @@ async function handlePhoto(e, stage, idx){
     const thumb = resizeAndStamp(cropped, 480, 0.6, stampLines, stage);
     state.photos[stage][idx] = { full, thumb };
     renderPhotoRow(stage);
+    gravarRascunhoAgora();
   }catch(err){
     showStatus('Não foi possível processar a foto. Tente novamente.', true);
   }
@@ -479,14 +482,21 @@ if('serviceWorker' in navigator){
 // ---------- Suporte offline: fila local de relatórios não sincronizados ----------
 const IDB_NAME = 'relatorio_offline_db';
 const IDB_STORE = 'pendentes';
+const RASCUNHO_STORE = 'rascunho';
 
 function abrirDBOffline(){
   return new Promise((resolve, reject)=>{
-    const req = indexedDB.open(IDB_NAME, 1);
+    const req = indexedDB.open(IDB_NAME, 2);
     req.onupgradeneeded = ()=>{
-      req.result.createObjectStore(IDB_STORE, { keyPath: 'localId' });
+      const db = req.result;
+      if(!db.objectStoreNames.contains(IDB_STORE)){ db.createObjectStore(IDB_STORE, { keyPath: 'localId' }); }
+      if(!db.objectStoreNames.contains(RASCUNHO_STORE)){ db.createObjectStore(RASCUNHO_STORE, { keyPath: 'id' }); }
     };
-    req.onsuccess = ()=> resolve(req.result);
+    req.onsuccess = ()=>{
+      req.result.onversionchange = ()=> req.result.close(); // não trava futuras atualizações do banco local
+      resolve(req.result);
+    };
+    req.onblocked = ()=> console.warn('Banco local aguardando outra aba do sistema ser fechada/recarregada.');
     req.onerror = ()=> reject(req.error);
   });
 }
@@ -567,6 +577,89 @@ async function sincronizarPendentesOffline(){
 }
 
 window.addEventListener('online', sincronizarPendentesOffline);
+
+// ---------- Rascunho automático ----------
+// Guarda no próprio aparelho o que está sendo preenchido (dados + fotos), para não
+// perder nada se o celular travar, a aba for descarregada ou a página recarregar.
+const CAMPOS_RASCUNHO = ['f_tecnico','f_base','f_data','f_local','f_equip','f_endereco','f_tipo','f_tag','obs_antes','obs_durante','obs_depois'];
+let rascunhoPronto = false;   // só começa a gravar depois de tentar restaurar o anterior
+let rascunhoTimer = null;
+
+function temConteudoRascunho(form, photos){
+  const temFoto = ['antes','durante','depois'].some(s => (photos[s] || []).some(Boolean));
+  const temTexto = CAMPOS_RASCUNHO.some(id => id !== 'f_tecnico' && id !== 'f_data' && (form[id] || '').trim() !== '');
+  return temFoto || temTexto;
+}
+
+async function gravarRascunhoAgora(){
+  if(!rascunhoPronto || state.editingId) return;
+  try{
+    const form = {};
+    CAMPOS_RASCUNHO.forEach(id => { form[id] = document.getElementById(id).value; });
+    const photos = {};
+    ['antes','durante','depois'].forEach(s => { photos[s] = state.photos[s].map(p => p ? { full: p.full } : null); });
+    const db = await abrirDBOffline();
+    await new Promise((resolve, reject)=>{
+      const tx = db.transaction(RASCUNHO_STORE, 'readwrite');
+      if(temConteudoRascunho(form, photos)){
+        tx.objectStore(RASCUNHO_STORE).put({ id: 'atual', form, photos, atualizadoEm: new Date().toISOString() });
+      } else {
+        tx.objectStore(RASCUNHO_STORE).delete('atual');
+      }
+      tx.oncomplete = ()=>resolve();
+      tx.onerror = ()=>reject(tx.error);
+    });
+  }catch(err){
+    console.error('Falha ao guardar rascunho:', err);
+  }
+}
+
+function agendarRascunho(){
+  clearTimeout(rascunhoTimer);
+  rascunhoTimer = setTimeout(gravarRascunhoAgora, 600);
+}
+
+async function limparRascunho(){
+  clearTimeout(rascunhoTimer);
+  try{
+    const db = await abrirDBOffline();
+    await new Promise((resolve, reject)=>{
+      const tx = db.transaction(RASCUNHO_STORE, 'readwrite');
+      tx.objectStore(RASCUNHO_STORE).delete('atual');
+      tx.oncomplete = ()=>resolve();
+      tx.onerror = ()=>reject(tx.error);
+    });
+  }catch(err){
+    console.error('Falha ao limpar rascunho:', err);
+  }
+}
+
+async function lerRascunho(){
+  const db = await abrirDBOffline();
+  return new Promise((resolve, reject)=>{
+    const tx = db.transaction(RASCUNHO_STORE, 'readonly');
+    const req = tx.objectStore(RASCUNHO_STORE).get('atual');
+    req.onsuccess = ()=>resolve(req.result || null);
+    req.onerror = ()=>reject(req.error);
+  });
+}
+
+function esconderBannerRascunho(){
+  const b = document.getElementById('rascunhoBanner');
+  b.style.display = 'none';
+  b.innerHTML = '';
+}
+
+function mostrarBannerRascunho(){
+  const b = document.getElementById('rascunhoBanner');
+  b.className = 'pending-banner';
+  b.style.display = 'flex';
+  b.innerHTML = '<span>Rascunho recuperado: suas fotos e dados anteriores foram restaurados.</span><a id="descartarRascunhoLink">Descartar</a>';
+  document.getElementById('descartarRascunhoLink').addEventListener('click', ()=>{
+    if(!confirm('Descartar o rascunho e limpar o formulário?')) return;
+    document.getElementById('btnLimpar').click();
+  });
+}
 
 // ---------- Supabase (banco de dados + fotos da equipe) ----------
 const SUPABASE_URL = 'https://qoxocixceqlouevhaofe.supabase.co';
@@ -926,6 +1019,7 @@ function sairModoEdicao(){
 }
 
 document.getElementById('btnLimpar').addEventListener('click', ()=>{
+  const estavaEditando = !!state.editingId;
   ['f_base','f_local','f_equip','f_endereco','f_tipo','f_tag','obs_antes','obs_durante','obs_depois'].forEach(id=>{
     document.getElementById(id).value='';
   });
@@ -933,6 +1027,8 @@ document.getElementById('btnLimpar').addEventListener('click', ()=>{
   state.photos = { antes:[null,null], durante:[null,null], depois:[null] };
   ['antes','durante','depois'].forEach(renderPhotoRow);
   sairModoEdicao();
+  esconderBannerRascunho();
+  if(!estavaEditando){ limparRascunho(); }
   showStatus('Formulário limpo.');
 });
 
@@ -1026,6 +1122,8 @@ document.getElementById('btnSalvar').addEventListener('click', async ()=>{
     } else {
       const seq = await salvarAtendimentoSupabase(form, state.photos);
       showStatus(`Relatório Nº ${String(seq).padStart(4,'0')} salvo no banco de dados da equipe.`);
+      esconderBannerRascunho();
+      await limparRascunho();
     }
   }catch(err){
     console.error(err);
@@ -1268,8 +1366,47 @@ document.getElementById('btnExportarLimpar').addEventListener('click', async ()=
     console.error('Falha ao checar pendentes offline:', err);
   }
 })();
+
+// Rascunho: ouve alterações no formulário, grava ao travar/sair e restaura ao abrir.
+(function(){
+  const aba = document.getElementById('tab-novo');
+  aba.addEventListener('input', agendarRascunho);
+  aba.addEventListener('change', agendarRascunho);
+  document.addEventListener('visibilitychange', ()=>{
+    if(document.visibilityState === 'hidden'){ clearTimeout(rascunhoTimer); gravarRascunhoAgora(); }
+  });
+  window.addEventListener('pagehide', ()=>{ clearTimeout(rascunhoTimer); gravarRascunhoAgora(); });
+})();
+
+(async ()=>{
+  try{
+    if(navigator.storage && navigator.storage.persist){ navigator.storage.persist(); }
+    const r = await lerRascunho();
+    // se o técnico já começou a tirar fotos nesta aba antes do banco local abrir, não sobrescreve
+    const jaTemFoto = ['antes','durante','depois'].some(s => state.photos[s].some(Boolean));
+    if(r && r.form && !jaTemFoto){
+      CAMPOS_RASCUNHO.forEach(id=>{
+        const v = r.form[id];
+        if((id === 'f_tecnico' || id === 'f_data') && !v) return;
+        document.getElementById(id).value = v || '';
+      });
+      const novas = { antes:[null,null], durante:[null,null], depois:[null] };
+      ['antes','durante','depois'].forEach(s=>{
+        ((r.photos && r.photos[s]) || []).forEach((p, i)=>{
+          if(p && i < novas[s].length){ novas[s][i] = { full: p.full }; }
+        });
+      });
+      state.photos = novas;
+      ['antes','durante','depois'].forEach(renderPhotoRow);
+      mostrarBannerRascunho();
+    }
+  }catch(err){
+    console.error('Falha ao recuperar rascunho:', err);
+  }
+  rascunhoPronto = true;
+})();
 </script>
 <div id="versaoApp" style="text-align:center;font-size:11px;color:#9a9a9a;padding:16px 0 24px;"></div>
-<script>document.getElementById('versaoApp').textContent = 'versão 2026-10-19c';</script>
+<script>document.getElementById('versaoApp').textContent = 'versão 2026-10-21a';</script>
 </body>
 </html>
