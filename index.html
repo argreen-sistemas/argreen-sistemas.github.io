@@ -892,22 +892,26 @@ function buildPdf(form, photos, logos){
   doc.text('EVIDÊNCIA FOTOGRÁFICA', pageW/2, margin+8, {align:'center'});
   doc.setFontSize(9); doc.setFont('helvetica','normal');
   doc.text((form.base||'').toUpperCase(), pageW/2, margin+14, {align:'center'});
-  if(form.seq){
-    doc.setFontSize(8); doc.setFont('helvetica','bold');
-    doc.text('Nº '+String(form.seq).padStart(4,'0'), pageW-margin-2, margin+5, {align:'right'});
-  }
-
   let y = margin+18;
   doc.setLineWidth(0.3);
-  doc.rect(margin, y, contentW, 9);
-  doc.line(margin+contentW*0.5, y, margin+contentW*0.5, y+9);
-  doc.setFontSize(9); doc.setFont('helvetica','bold');
+  // linha LOCAL / DATA: a altura cresce se o nome do local for grande (antes vazava da caixa)
+  doc.setFontSize(9); doc.setFont('helvetica','normal');
+  const linhasLocal = doc.splitTextToSize(String(form.local || ''), contentW*0.5-18);
+  const passoLocal = 4.2;
+  const alturaLocal = Math.max(9, 5.8 + (linhasLocal.length-1)*passoLocal + 3.2);
+  doc.rect(margin, y, contentW, alturaLocal);
+  doc.line(margin+contentW*0.5, y, margin+contentW*0.5, y+alturaLocal);
+  doc.setFont('helvetica','bold');
   doc.text('LOCAL:', margin+2, y+5.8);
   doc.text('DATA:', margin+contentW*0.5+2, y+5.8);
+  if(form.seq){
+    // número do relatório no canto direito desta linha (livre, longe dos logos)
+    doc.text('Nº '+String(form.seq).padStart(4,'0'), pageW-margin-2, y+5.8, {align:'right'});
+  }
   doc.setFont('helvetica','normal');
-  doc.text(form.local, margin+16, y+5.8, {maxWidth: contentW*0.5-18});
+  linhasLocal.forEach((linha, i)=> doc.text(linha, margin+16, y+5.8+i*passoLocal));
   doc.text(fmtDateBR(form.data), margin+contentW*0.5+16, y+5.8);
-  y += 9;
+  y += alturaLocal;
 
   // meta line
   const metaParts = [
@@ -916,13 +920,32 @@ function buildPdf(form, photos, logos){
     form.tipo && ('Tipo: '+form.tipo),
     form.tag && ('TAG: '+form.tag),
     form.endereco && ('Endereço: '+form.endereco)
-  ].filter(Boolean).join('   |   ');
-  if(metaParts){
-    doc.setFontSize(8); doc.setTextColor(90,95,90);
-    doc.rect(margin, y, contentW, 6);
-    doc.text(metaParts, margin+2, y+4, {maxWidth: contentW-4});
+  ].filter(Boolean);
+  if(metaParts.length){
+    doc.setFontSize(8); doc.setFont('helvetica','normal'); doc.setTextColor(90,95,90);
+    // quebra em linhas entre um campo e outro, e a caixa cresce para caber tudo
+    const sepMeta = '   |   ';
+    const larguraMeta = contentW - 4;
+    const linhasMeta = [];
+    let atualMeta = '';
+    metaParts.forEach(parte=>{
+      const candidata = atualMeta ? atualMeta + sepMeta + parte : parte;
+      if(doc.getTextWidth(candidata) <= larguraMeta){ atualMeta = candidata; return; }
+      if(atualMeta){ linhasMeta.push(atualMeta); atualMeta = ''; }
+      if(doc.getTextWidth(parte) <= larguraMeta){ atualMeta = parte; }
+      else {
+        const pedacos = doc.splitTextToSize(parte, larguraMeta);
+        pedacos.slice(0, -1).forEach(pd => linhasMeta.push(pd));
+        atualMeta = pedacos[pedacos.length-1];
+      }
+    });
+    if(atualMeta) linhasMeta.push(atualMeta);
+    const passoMeta = 3.7;
+    const alturaMeta = 4 + (linhasMeta.length-1)*passoMeta + 2;
+    doc.rect(margin, y, contentW, alturaMeta);
+    linhasMeta.forEach((linha, i)=> doc.text(linha, margin+2, y+4+i*passoMeta));
     doc.setTextColor(0,0,0);
-    y += 6;
+    y += alturaMeta;
   }
 
   const stages = [
@@ -1469,6 +1492,6 @@ function bloquearSemUnidade(){
 })();
 </script>
 <div id="versaoApp" style="text-align:center;font-size:11px;color:#9a9a9a;padding:16px 0 24px;"></div>
-<script>document.getElementById('versaoApp').textContent = 'versão 2026-10-21b';</script>
+<script>document.getElementById('versaoApp').textContent = 'versão 2026-10-22a';</script>
 </body>
 </html>
