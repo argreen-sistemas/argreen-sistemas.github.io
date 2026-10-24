@@ -96,6 +96,8 @@
     width:24px;height:24px;border-radius:50%;cursor:pointer;font-size:14px;line-height:1;
   }
   .photo-slot input[type=file]{display:none;}
+  .photo-slot .slot-btns{display:flex;flex-direction:column;gap:6px;margin-top:8px;}
+  .photo-slot .slot-btn{padding:8px 10px;border:1px solid var(--green);background:#fff;color:var(--green-dark);border-radius:var(--radius);font-weight:700;font-size:13px;cursor:pointer;}
 
   .btn{
     padding:11px 18px;border:none;border-radius:var(--radius);font-weight:700;font-size:14px;cursor:pointer;
@@ -284,6 +286,83 @@ function slotLabel(stage, idx){
   return n>1 ? `Foto ${idx+1}` : 'Foto';
 }
 
+// Cria o seletor de foto de um quadro: 'camera' abre a câmera direto; 'galeria' abre
+// as fotos já salvas no celular (no Android também oferece a câmera).
+function criarInputFoto(stage, idx, origem){
+  const input = document.createElement('input');
+  input.type = 'file'; input.accept = 'image/*';
+  if(origem === 'camera'){ input.setAttribute('capture', 'environment'); }
+  input.addEventListener('change', (e)=> handlePhoto(e, stage, idx, origem));
+  return input;
+}
+
+// Lê a data em que a foto foi realmente tirada (EXIF de JPEG). Usada para o carimbo
+// das fotos que vêm da galeria, para o carimbo não mostrar a data de hoje numa foto antiga.
+function dataExifDoJpeg(buf){
+  const v = new DataView(buf);
+  if(v.byteLength < 12 || v.getUint16(0) !== 0xFFD8) return null;
+  let off = 2;
+  while(off + 4 <= v.byteLength){
+    if(v.getUint8(off) !== 0xFF) return null;
+    const marcador = v.getUint8(off + 1);
+    if(marcador === 0xDA || marcador === 0xD9) return null;
+    const tam = v.getUint16(off + 2);
+    if(marcador === 0xE1 && off + 10 <= v.byteLength && v.getUint32(off + 4) === 0x45786966){
+      return lerDatasTiff(v, off + 10);
+    }
+    off += 2 + tam;
+  }
+  return null;
+}
+
+function lerDatasTiff(v, t){
+  const fim = v.byteLength;
+  if(t + 8 > fim) return null;
+  const little = v.getUint16(t) === 0x4949;
+  const u16 = (o)=> v.getUint16(o, little);
+  const u32 = (o)=> v.getUint32(o, little);
+  function texto(o, n){
+    let r = '';
+    for(let i=0; i<n && o+i<fim; i++){ const c = v.getUint8(o+i); if(c === 0) break; r += String.fromCharCode(c); }
+    return r;
+  }
+  function lerIfd(ifd){
+    const r = {};
+    if(ifd + 2 > fim) return r;
+    const n = u16(ifd);
+    for(let i=0; i<n; i++){
+      const e = ifd + 2 + i*12;
+      if(e + 12 > fim) break;
+      const tag = u16(e), tipo = u16(e+2), cont = u32(e+4);
+      if(tipo === 2){
+        r[tag] = texto(cont > 4 ? t + u32(e+8) : e + 8, cont);
+      } else if(tag === 0x8769 && tipo === 4){
+        r[tag] = u32(e+8);
+      }
+    }
+    return r;
+  }
+  const ifd0 = lerIfd(t + u32(t + 4));
+  const exif = ifd0[0x8769] ? lerIfd(t + ifd0[0x8769]) : {};
+  const bruto = exif[0x9003] || exif[0x9004] || ifd0[0x0132];
+  const m = bruto && bruto.match(/^(\d{4}):(\d{2}):(\d{2}) (\d{2}):(\d{2}):(\d{2})/);
+  if(!m || +m[1] < 2000) return null;
+  const d = new Date(+m[1], +m[2]-1, +m[3], +m[4], +m[5], +m[6]);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+async function dataDaFoto(file){
+  try{
+    const buf = await file.slice(0, 131072).arrayBuffer();
+    const d = dataExifDoJpeg(buf);
+    if(d) return d;
+  }catch(e){}
+  if(file.lastModified && file.lastModified > 946684800000 && file.lastModified <= Date.now() + 86400000){
+    return new Date(file.lastModified);
+  }
+  return null;
+}
+
 function renderPhotoRow(stage){
   const row = document.getElementById('row_'+stage);
   row.innerHTML = '';
@@ -296,16 +375,25 @@ function renderPhotoRow(stage){
     } else {
       slot.innerHTML = `<div class="placeholder">
         <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#8a938e" stroke-width="1.6"><path d="M4 7h3l2-2h6l2 2h3v12H4z"/><circle cx="12" cy="13" r="3.5"/></svg>
-        ${slotLabel(stage, idx)}<br><span style="font-size:10.5px;">toque para tirar/enviar</span>
+        ${slotLabel(stage, idx)}
+        <div class="slot-btns">
+          <button type="button" class="slot-btn" data-acao="camera">Câmera</button>
+          <button type="button" class="slot-btn" data-acao="galeria">Galeria</button>
+        </div>
       </div>`;
     }
-    const input = document.createElement('input');
-    input.type='file'; input.accept='image/*'; input.capture='environment';
-    input.addEventListener('change', (e)=> handlePhoto(e, stage, idx));
-    slot.appendChild(input);
+    const inputCamera = criarInputFoto(stage, idx, 'camera');
+    const inputGaleria = criarInputFoto(stage, idx, 'galeria');
+    slot.appendChild(inputCamera);
+    slot.appendChild(inputGaleria);
     slot.addEventListener('click', (e)=>{
+      if(e.target.tagName === 'INPUT') return;                 // clique interno do próprio seletor
       if(e.target.classList.contains('remove-btn')) return;
-      input.click();
+      const botao = e.target.closest('.slot-btn');
+      if(botao){ (botao.dataset.acao === 'galeria' ? inputGaleria : inputCamera).click(); return; }
+      // toque fora dos botões: quadro vazio abre a câmera (como antes);
+      // quadro preenchido abre o seletor do celular para trocar a foto
+      (photo ? inputGaleria : inputCamera).click();
     });
     row.appendChild(slot);
   });
@@ -440,18 +528,20 @@ function resizeAndStamp(img, maxW, quality, stampLines, stage){
   return canvas.toDataURL('image/jpeg', quality);
 }
 
-async function handlePhoto(e, stage, idx){
+async function handlePhoto(e, stage, idx, origem){
   const file = e.target.files[0];
   if(!file) return;
   try{
     const dataUrl = await readFileAsDataURL(file);
     const img = await loadImage(dataUrl);
     const cropped = autoCropCover(img, PHOTO_ASPECT);
-    const now = new Date();
+    // câmera: carimba a hora de agora. Galeria: carimba a data em que a foto foi tirada.
+    let quando = new Date();
+    if(origem !== 'camera'){ quando = (await dataDaFoto(file)) || quando; }
     const stageLabels = { antes:'#Antes', durante:'#Durante', depois:'#Depois' };
     const fData = document.getElementById('f_data').value;
     const stampLines = [
-      now.toLocaleString('pt-BR'),
+      quando.toLocaleString('pt-BR'),
       document.getElementById('f_base').value ? ('Base: '+document.getElementById('f_base').value) : '',
       fData ? ('Data: '+fmtDateBR(fData)) : '',
       document.getElementById('f_local').value ? ('Local: '+document.getElementById('f_local').value) : '',
@@ -1492,6 +1582,6 @@ function bloquearSemUnidade(){
 })();
 </script>
 <div id="versaoApp" style="text-align:center;font-size:11px;color:#9a9a9a;padding:16px 0 24px;"></div>
-<script>document.getElementById('versaoApp').textContent = 'versão 2026-10-22a';</script>
+<script>document.getElementById('versaoApp').textContent = 'versão 2026-10-23a';</script>
 </body>
 </html>
