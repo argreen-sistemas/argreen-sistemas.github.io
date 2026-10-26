@@ -355,10 +355,12 @@ async function dataDaFoto(file){
   try{
     const buf = await file.slice(0, 131072).arrayBuffer();
     const d = dataExifDoJpeg(buf);
-    if(d) return d;
+    if(d) return { data: d, fonte: 'exif' };
   }catch(e){}
+  // sem data gravada na foto (ex.: foto recebida por WhatsApp): a data do arquivo costuma ser
+  // a de quando ela foi salva no celular, não a de quando foi tirada. Serve só como pista.
   if(file.lastModified && file.lastModified > 946684800000 && file.lastModified <= Date.now() + 86400000){
-    return new Date(file.lastModified);
+    return { data: new Date(file.lastModified), fonte: 'arquivo' };
   }
   return null;
 }
@@ -535,15 +537,21 @@ async function handlePhoto(e, stage, idx, origem){
     const dataUrl = await readFileAsDataURL(file);
     const img = await loadImage(dataUrl);
     const cropped = autoCropCover(img, PHOTO_ASPECT);
-    // câmera: carimba a hora de agora. Galeria: carimba a data em que a foto foi tirada.
-    let quando = new Date();
-    if(origem !== 'camera'){ quando = (await dataDaFoto(file)) || quando; }
+    // câmera: carimba a hora de agora. Galeria: carimba a data em que a foto foi tirada (gravada
+    // na própria foto). Se a foto não tiver essa data, o carimbo avisa em vez de inventar uma.
+    let linhaData;
+    if(origem === 'camera'){
+      linhaData = new Date().toLocaleString('pt-BR');
+    } else {
+      const info = await dataDaFoto(file);
+      if(info && info.fonte === 'exif'){ linhaData = info.data.toLocaleString('pt-BR'); }
+      else if(info){ linhaData = info.data.toLocaleString('pt-BR') + ' (data do arquivo)'; }
+      else { linhaData = 'Data original indisponível'; }
+    }
     const stageLabels = { antes:'#Antes', durante:'#Durante', depois:'#Depois' };
-    const fData = document.getElementById('f_data').value;
     const stampLines = [
-      quando.toLocaleString('pt-BR'),
+      linhaData,
       document.getElementById('f_base').value ? ('Base: '+document.getElementById('f_base').value) : '',
-      fData ? ('Data: '+fmtDateBR(fData)) : '',
       document.getElementById('f_local').value ? ('Local: '+document.getElementById('f_local').value) : '',
       document.getElementById('f_equip').value ? ('Equipamento: '+document.getElementById('f_equip').value) : '',
       document.getElementById('f_endereco').value ? ('Endereço: '+document.getElementById('f_endereco').value) : '',
@@ -1582,6 +1590,6 @@ function bloquearSemUnidade(){
 })();
 </script>
 <div id="versaoApp" style="text-align:center;font-size:11px;color:#9a9a9a;padding:16px 0 24px;"></div>
-<script>document.getElementById('versaoApp').textContent = 'versão 2026-10-23a';</script>
+<script>document.getElementById('versaoApp').textContent = 'versão 2026-10-26a';</script>
 </body>
 </html>
