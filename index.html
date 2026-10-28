@@ -1164,17 +1164,59 @@ function sairModoEdicao(){
   document.getElementById('btnSalvar').textContent = 'Salvar no histórico';
 }
 
-document.getElementById('btnLimpar').addEventListener('click', ()=>{
-  const estavaEditando = !!state.editingId;
+function limparFormulario(){
   ['f_base','f_local','f_equip','f_endereco','f_tipo','f_tag','obs_antes','obs_durante','obs_depois'].forEach(id=>{
     document.getElementById(id).value='';
   });
   document.getElementById('f_data').value = todayISO();
   state.photos = { antes:[null,null], durante:[null,null], depois:[null] };
   ['antes','durante','depois'].forEach(renderPhotoRow);
+}
+
+// O que estava sendo preenchido antes de abrir um relatório salvo para editar.
+// Fica guardado na memória enquanto dura a edição, e volta ao cancelar ou ao terminar de salvar.
+let rascunhoPausado = null;
+
+function guardarRascunhoAtual(){
+  const form = {};
+  CAMPOS_RASCUNHO.forEach(id => { form[id] = document.getElementById(id).value; });
+  const photos = {
+    antes: [...state.photos.antes], durante: [...state.photos.durante], depois: [...state.photos.depois]
+  };
+  return { form, photos, temConteudo: temConteudoRascunho(form, photos) };
+}
+
+function voltarAoRascunhoPausado(){
+  const snap = rascunhoPausado;
+  rascunhoPausado = null;
+  if(!snap){ limparFormulario(); return; }
+  if(!snap.temConteudo){
+    // não havia nada em andamento: formulário limpo, mas o técnico volta a ser quem estava usando
+    limparFormulario();
+    if(snap.form.f_tecnico){ document.getElementById('f_tecnico').value = snap.form.f_tecnico; }
+    return;
+  }
+  CAMPOS_RASCUNHO.forEach(id => {
+    const v = snap.form[id];
+    if((id === 'f_tecnico' || id === 'f_data') && !v) return;
+    document.getElementById(id).value = v || '';
+  });
+  state.photos = { antes: snap.photos.antes, durante: snap.photos.durante, depois: snap.photos.depois };
+  ['antes','durante','depois'].forEach(renderPhotoRow);
+}
+
+function cancelarEdicao(){
+  sairModoEdicao();
+  voltarAoRascunhoPausado();
+  showStatus('Edição cancelada. O formulário voltou ao que você estava preenchendo.');
+}
+
+document.getElementById('btnLimpar').addEventListener('click', ()=>{
+  if(state.editingId){ cancelarEdicao(); return; }
+  limparFormulario();
   sairModoEdicao();
   esconderBannerRascunho();
-  if(!estavaEditando){ limparRascunho(); }
+  limparRascunho();
   showStatus('Formulário limpo.');
 });
 
@@ -1183,17 +1225,6 @@ async function carregarParaEdicao(r){
   if(!r) return;
   document.querySelector('.tab-btn[data-tab="novo"]').click();
   showStatus('Carregando relatório para edição...');
-  document.getElementById('f_tecnico').value = r.form.tecnico || '';
-  document.getElementById('f_base').value = r.form.base || '';
-  document.getElementById('f_data').value = r.form.data || todayISO();
-  document.getElementById('f_local').value = r.form.local || '';
-  document.getElementById('f_equip').value = r.form.equip || '';
-  document.getElementById('f_endereco').value = r.form.endereco || '';
-  document.getElementById('f_tipo').value = r.form.tipo || '';
-  document.getElementById('f_tag').value = r.form.tag || '';
-  document.getElementById('obs_antes').value = r.form.obsAntes || '';
-  document.getElementById('obs_durante').value = r.form.obsDurante || '';
-  document.getElementById('obs_depois').value = r.form.obsDepois || '';
 
   const novasFotos = { antes:[null,null], durante:[null,null], depois:[null] };
   const buscas = [];
@@ -1209,9 +1240,26 @@ async function carregarParaEdicao(r){
   try{
     await Promise.all(buscas);
   }catch(err){
+    // editar com foto faltando e salvar apagaria as fotos que não carregaram: então não abre a edição
     console.error(err);
-    showStatus('Não foi possível carregar todas as fotos desse relatório.', true);
+    showStatus('Não consegui carregar todas as fotos desse relatório, então a edição não foi aberta (nada foi alterado). Tente de novo em instantes.', true);
+    return;
   }
+
+  // guarda o que estava sendo preenchido (se já está editando outro relatório, mantém o original)
+  if(!state.editingId){ rascunhoPausado = guardarRascunhoAtual(); }
+
+  document.getElementById('f_tecnico').value = r.form.tecnico || '';
+  document.getElementById('f_base').value = r.form.base || '';
+  document.getElementById('f_data').value = r.form.data || todayISO();
+  document.getElementById('f_local').value = r.form.local || '';
+  document.getElementById('f_equip').value = r.form.equip || '';
+  document.getElementById('f_endereco').value = r.form.endereco || '';
+  document.getElementById('f_tipo').value = r.form.tipo || '';
+  document.getElementById('f_tag').value = r.form.tag || '';
+  document.getElementById('obs_antes').value = r.form.obsAntes || '';
+  document.getElementById('obs_durante').value = r.form.obsDurante || '';
+  document.getElementById('obs_depois').value = r.form.obsDepois || '';
   state.photos = novasFotos;
   ['antes','durante','depois'].forEach(renderPhotoRow);
 
@@ -1220,9 +1268,7 @@ async function carregarParaEdicao(r){
   banner.className = 'edit-banner';
   banner.style.display = 'flex';
   banner.innerHTML = `<span>Editando o relatório Nº ${String(r.id).padStart(4,'0')}. Salvar vai atualizar esse mesmo relatório.</span><a id="cancelarEdicaoLink">Cancelar edição</a>`;
-  document.getElementById('cancelarEdicaoLink').addEventListener('click', ()=>{
-    document.getElementById('btnLimpar').click();
-  });
+  document.getElementById('cancelarEdicaoLink').addEventListener('click', cancelarEdicao);
   document.getElementById('btnSalvar').textContent = 'Salvar alterações';
   window.scrollTo({top:0, behavior:'smooth'});
   showStatus('Relatório carregado. Faça as alterações e clique em "Salvar alterações".');
@@ -1265,6 +1311,7 @@ document.getElementById('btnSalvar').addEventListener('click', async ()=>{
       const id = await atualizarAtendimentoSupabase(state.editingId, form, state.photos);
       showStatus(`Relatório Nº ${String(id).padStart(4,'0')} atualizado com sucesso.`);
       sairModoEdicao();
+      voltarAoRascunhoPausado();
     } else {
       const seq = await salvarAtendimentoSupabase(form, state.photos);
       showStatus(`Relatório Nº ${String(seq).padStart(4,'0')} salvo no banco de dados da equipe.`);
@@ -1288,7 +1335,7 @@ document.getElementById('btnSalvar').addEventListener('click', async ()=>{
       showStatus(state.editingId ? 'Falha ao atualizar. Verifique sua conexão e tente novamente.' : 'Falha ao salvar no banco. Verifique sua conexão e tente novamente.', true);
     }
   }finally{
-    btn.disabled = false; btn.textContent = state.editingId ? 'Salvar alterações' : textoOriginal;
+    btn.disabled = false; btn.textContent = state.editingId ? 'Salvar alterações' : 'Salvar no histórico';
   }
 });
 
@@ -1590,6 +1637,6 @@ function bloquearSemUnidade(){
 })();
 </script>
 <div id="versaoApp" style="text-align:center;font-size:11px;color:#9a9a9a;padding:16px 0 24px;"></div>
-<script>document.getElementById('versaoApp').textContent = 'versão 2026-10-26a';</script>
+<script>document.getElementById('versaoApp').textContent = 'versão 2026-10-26b';</script>
 </body>
 </html>
