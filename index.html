@@ -152,6 +152,7 @@
   <div id="statusBox"></div>
   <div id="editBanner" style="display:none;"></div>
   <div id="pendentesBanner" style="display:none;"></div>
+  <div id="avisoLegado" style="display:none;"></div>
   <div id="rascunhoBanner" style="display:none;"></div>
 
   <!-- NOVO RELATÓRIO -->
@@ -664,6 +665,17 @@ let sincronizandoAgora = false;
 async function sincronizarPendentesOffline(){
   if(sincronizandoAgora) return;
   if(!navigator.onLine) return;
+  if(navigator.locks){
+    // só uma aba do aparelho sincroniza por vez
+    return navigator.locks.request('sync-pendentes', { ifAvailable: true }, async (lock)=>{
+      if(lock){ await sincronizarPendentesInterno(); }
+    });
+  }
+  return sincronizarPendentesInterno();
+}
+
+async function sincronizarPendentesInterno(){
+  if(sincronizandoAgora) return;
   sincronizandoAgora = true;
   let pendentes;
   try{ pendentes = await listarPendentesOffline(); }
@@ -831,26 +843,69 @@ async function urlToDataURL(url, tentativas = 4){
 
 // Salva um atendimento completo: cria a linha em "atendimentos" (o id vira o
 // número sequencial), sobe cada foto pro R2 (via Worker) e registra o caminho em "fotos".
+// Envia uma foto (arquivo no R2 + linha na tabela fotos). Tenta até 3 vezes, sempre no mesmo
+// caminho, para a nova tentativa sobrescrever em vez de deixar arquivo solto.
+async function enviarUmaFoto(atendimentoId, etapa, idx, p){
+  const path = `${atendimentoId}/${etapa}_${idx}_${Date.now()}.jpg`;
+  const blob = dataUrlToBlob(p.full);
+  let ultimoErro;
+  for(let t=0; t<3; t++){
+    try{
+      if(t > 0){
+        // a tentativa anterior pode ter gravado a linha e perdido só a resposta: não duplica
+        const { data: ja } = await sb.from('fotos').select('id').eq('storage_path', path).limit(1);
+        if(ja && ja.length) return path;
+      }
+      const resp = await fetch(`${R2_WORKER_URL}/fotos/${encodeURIComponent(path)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'image/jpeg' },
+        body: blob
+      });
+      if(!resp.ok) throw new Error('Falha ao enviar foto para o R2 (status ' + resp.status + ')');
+      const { error: errFoto } = await sb.from('fotos').insert({ atendimento_id: atendimentoId, etapa, ordem: idx, storage_path: path });
+      if(errFoto) throw errFoto;
+      return path;
+    }catch(err){
+      ultimoErro = err;
+      if(t < 2){ await new Promise(r => setTimeout(r, 800 * (t + 1))); }
+    }
+  }
+  throw ultimoErro;
+}
+
+// Apaga fotos já enviadas (arquivo + linha), usado para desfazer um envio que não terminou.
+async function desfazerEnvio(caminhos){
+  if(!caminhos || !caminhos.length) return;
+  await Promise.all(caminhos.map(c =>
+    fetch(`${R2_WORKER_URL}/fotos/${encodeURIComponent(c)}`, { method: 'DELETE' })
+      .catch(err => console.error('Falha ao desfazer foto no R2:', c, err))
+  ));
+  try{ await sb.from('fotos').delete().in('storage_path', caminhos); }
+  catch(err){ console.error('Falha ao desfazer linhas de fotos:', err); }
+}
+
+// Envia todas as fotos, no máximo 2 por vez (conexão de celular falha menos em fila curta).
+// Se alguma não conseguir ser enviada, desfaz as que já foram e avisa com erro.
 async function uploadFotos(atendimentoId, photos){
-  const uploads = [];
+  const tarefas = [];
   ['antes','durante','depois'].forEach(etapa=>{
-    photos[etapa].forEach((p, idx)=>{
-      if(!p) return;
-      uploads.push((async ()=>{
-        const path = `${atendimentoId}/${etapa}_${idx}_${Date.now()}.jpg`;
-        const blob = dataUrlToBlob(p.full);
-        const resp = await fetch(`${R2_WORKER_URL}/fotos/${encodeURIComponent(path)}`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'image/jpeg' },
-          body: blob
-        });
-        if(!resp.ok) throw new Error('Falha ao enviar foto para o R2 (status ' + resp.status + ')');
-        const { error: errFoto } = await sb.from('fotos').insert({ atendimento_id: atendimentoId, etapa, ordem: idx, storage_path: path });
-        if(errFoto) throw errFoto;
-      })());
-    });
+    photos[etapa].forEach((p, idx)=>{ if(p) tarefas.push({ etapa, idx, p }); });
   });
-  await Promise.all(uploads);
+  const enviados = [];
+  let primeiroErro = null;
+  for(let i=0; i<tarefas.length && !primeiroErro; i+=2){
+    const lote = tarefas.slice(i, i + 2);
+    const resultados = await Promise.allSettled(lote.map(t => enviarUmaFoto(atendimentoId, t.etapa, t.idx, t.p)));
+    resultados.forEach(r => {
+      if(r.status === 'fulfilled'){ enviados.push(r.value); }
+      else if(!primeiroErro){ primeiroErro = r.reason; }
+    });
+  }
+  if(primeiroErro){
+    await desfazerEnvio(enviados);
+    throw primeiroErro;
+  }
+  return enviados;
 }
 
 async function removerFotosDoAtendimento(id){
@@ -871,22 +926,40 @@ async function salvarAtendimentoSupabase(form, photos){
     obs_antes: form.obsAntes, obs_durante: form.obsDurante, obs_depois: form.obsDepois
   }).select().single();
   if(errAt) throw errAt;
-  await uploadFotos(atendimento.id, photos);
+  try{
+    await uploadFotos(atendimento.id, photos);
+  }catch(err){
+    // não deixa relatório sem fotos nem pela metade: apaga o que acabou de criar,
+    // e o técnico (ou a fila offline) pode tentar de novo sem gerar duplicado
+    try{ await sb.from('atendimentos').delete().eq('id', atendimento.id); }
+    catch(e2){ console.error('Falha ao desfazer o relatório criado:', e2); }
+    throw err;
+  }
   return atendimento.id;
 }
 
 // Atualiza um atendimento já salvo: troca os dados e substitui todas as fotos
 // pelo conjunto atual (mais simples e sem risco de duplicar/perder foto).
 async function atualizarAtendimentoSupabase(id, form, photos){
-  const { data: atualizados, error: errAt } = await sb.from('atendimentos').update({
-    tecnico: form.tecnico, base: form.base, data: form.data, local: form.local,
-    equipamento: form.equip, endereco: form.endereco, tipo: form.tipo, tag: form.tag,
-    obs_antes: form.obsAntes, obs_durante: form.obsDurante, obs_depois: form.obsDepois
-  }).eq('id', id).select('id');
-  if(errAt) throw errAt;
-  if(!atualizados || !atualizados.length) throw new Error('Sem permissão para alterar este relatório');
-  await removerFotosDoAtendimento(id);
-  await uploadFotos(id, photos);
+  const { data: antigas } = await sb.from('fotos').select('storage_path').eq('atendimento_id', id);
+  // 1) grava as fotos novas (se falhar, desfaz só as novas e o relatório fica exatamente como estava)
+  const novas = await uploadFotos(id, photos);
+  try{
+    const { data: atualizados, error: errAt } = await sb.from('atendimentos').update({
+      tecnico: form.tecnico, base: form.base, data: form.data, local: form.local,
+      equipamento: form.equip, endereco: form.endereco, tipo: form.tipo, tag: form.tag,
+      obs_antes: form.obsAntes, obs_durante: form.obsDurante, obs_depois: form.obsDepois
+    }).eq('id', id).select('id');
+    if(errAt) throw errAt;
+    if(!atualizados || !atualizados.length) throw new Error('Sem permissão para alterar este relatório');
+  }catch(err){
+    await desfazerEnvio(novas);
+    throw err;
+  }
+  // 2) só agora, com tudo gravado, apaga as fotos antigas
+  if(antigas && antigas.length){
+    await desfazerEnvio(antigas.map(f => f.storage_path));
+  }
   return id;
 }
 
@@ -1276,6 +1349,7 @@ async function carregarParaEdicao(r){
 
 // ---------- Save to shared history ----------
 document.getElementById('btnSalvar').addEventListener('click', async ()=>{
+  if(document.getElementById('btnSalvar').disabled) return;
   const form = collectFormData();
   const hasAnyPhoto = ['antes','durante','depois'].some(s=>state.photos[s].some(Boolean));
   if(!hasAnyPhoto){ showStatus('Adicione ao menos uma foto antes de salvar.', true); return; }
@@ -1581,6 +1655,12 @@ function bloquearSemUnidade(){
     // servidor. Bloqueia para nunca gravar relatório na unidade errada.
     if(CHAVE_UNIDADE && data.legado){ bloquearSemUnidade(); return; }
     UNIDADE_INFO = data;
+    if(data.legado){
+      const aviso = document.getElementById('avisoLegado');
+      aviso.className = 'edit-banner';
+      aviso.style.display = 'flex';
+      aviso.innerHTML = '<span>Você está usando o endereço antigo do sistema. Peça ao responsável o link atualizado da sua unidade e abra-o uma vez neste aparelho: o endereço antigo vai deixar de funcionar.</span>';
+    }
     try{ localStorage.setItem('unidade_nome', data.nome); }catch(e){}
     label.textContent = data.admin ? 'Administrador — somente leitura (todas as unidades)' : ('Unidade: ' + data.nome);
     label.style.display = 'block';
@@ -1637,6 +1717,6 @@ function bloquearSemUnidade(){
 })();
 </script>
 <div id="versaoApp" style="text-align:center;font-size:11px;color:#9a9a9a;padding:16px 0 24px;"></div>
-<script>document.getElementById('versaoApp').textContent = 'versão 2026-10-26b';</script>
+<script>document.getElementById('versaoApp').textContent = 'versão 2026-11-02a';</script>
 </body>
 </html>
