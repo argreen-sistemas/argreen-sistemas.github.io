@@ -545,8 +545,7 @@ async function handlePhoto(e, stage, idx, origem){
       linhaData = new Date().toLocaleString('pt-BR');
     } else {
       const info = await dataDaFoto(file);
-      if(info && info.fonte === 'exif'){ linhaData = info.data.toLocaleString('pt-BR'); }
-      else if(info){ linhaData = info.data.toLocaleString('pt-BR') + ' (data do arquivo)'; }
+      if(info){ linhaData = info.data.toLocaleString('pt-BR'); }
       else { linhaData = 'Data original indisponível'; }
     }
     const stageLabels = { antes:'#Antes', durante:'#Durante', depois:'#Depois' };
@@ -1717,6 +1716,6 @@ function bloquearSemUnidade(){
 })();
 </script>
 <div id="versaoApp" style="text-align:center;font-size:11px;color:#9a9a9a;padding:16px 0 24px;"></div>
-<script>document.getElementById('versaoApp').textContent = 'versão 2026-11-02a';</script>
+<script>document.getElementById('versaoApp').textContent = 'versão 2026-11-03a';</script>
 </body>
 </html>
